@@ -11,6 +11,7 @@ This document provides detailed documentation for all MCP tools provided by rema
 | [`remarkable_search`](#remarkable_search) | Search across multiple documents |
 | [`remarkable_recent`](#remarkable_recent) | Get recently modified documents |
 | [`remarkable_status`](#remarkable_status) | Check connection status |
+| [`remarkable_page`](#remarkable_page) | Get page images with pagination metadata |
 | [`remarkable_image`](#remarkable_image) | Get page images (PNG or SVG) |
 
 These core tools are **read-only** and return structured JSON with hints for logical next actions. Write tools (upload, mkdir, move, rename, delete) are enabled by default and documented in the [README](../README.md#write-tools-cloud-ssh--usb-web).
@@ -308,6 +309,45 @@ remarkable_status()
 | `capabilities_by_transport` | The full per-transport capability matrix |
 | `root_path` | Configured root path filter (only present if set) |
 | `ocr_backend` | Which OCR backend is configured |
+
+---
+
+## remarkable_page
+
+**Get a page image together with pagination metadata.**
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `document` | string | *required* | Document name or full path |
+| `page` | int | `1` | Page number (1-indexed) |
+| `background` | string | `"#FBFBFB"` | Background color (hex RGB or RGBA) |
+| `output_format` | string | `"png"` | Output format: `"png"` or `"svg"` |
+| `include_ocr` | bool | `False` | Enable OCR on the image (uses sampling if configured) |
+| `compatibility` | bool | `False` | Return JSON with image data instead of an embedded resource |
+| `render_merged` | bool | `False` | Composite PDF + annotations when available |
+
+### Examples
+
+```python
+remarkable_page("Meeting Notes", page=2)
+remarkable_page("Sketch", background="#00000000")
+```
+
+### Response Format
+
+```json
+{
+  "page": 37,
+  "total_pages": 40,
+  "modified": "2025-11-28T10:30:00Z",
+  "more": true,
+  "image": "<PNG>"
+}
+```
+
+When `compatibility=True`, the response keeps the same image payload shape as `remarkable_image` while also including `page`, `total_pages`, `modified`, and `more`.
 
 ---
 

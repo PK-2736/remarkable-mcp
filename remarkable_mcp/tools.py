@@ -12,7 +12,7 @@ import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from mcp.server.fastmcp import Context
 from mcp.types import (
@@ -117,6 +117,42 @@ def _resolve_root_path(path: str) -> str:
     return root + path
 
 
+def _resolve_document_target(document: str, collection, items_by_id: dict, root: str):
+    """Resolve a document name/path to a target item while preserving existing behavior."""
+    actual_document = _resolve_root_path(document) if document.startswith("/") else document
+    documents = [item for item in collection if not item.is_folder]
+    target_doc = None
+    document_lower = actual_document.lower().strip("/")
+
+    for doc in documents:
+        doc_path = get_item_path(doc, items_by_id)
+        if not _is_within_root(doc_path, root):
+            continue
+        if doc.VissibleName.lower() == document_lower:
+            target_doc = doc
+            break
+        if doc_path.lower().strip("/") == document_lower:
+            target_doc = doc
+            break
+
+    if target_doc:
+        return target_doc, get_item_path(target_doc, items_by_id)
+
+    filtered_docs = [doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)]
+    similar = find_similar_documents(document, filtered_docs)
+    search_term = document.split()[0] if document else "notes"
+    error = make_error(
+        error_type="document_not_found",
+        message=f"Document not found: '{document}'",
+        suggestion=(
+            f"Try remarkable_browse(query='{search_term}') to search, "
+            "or remarkable_browse('/') to list all files."
+        ),
+        did_you_mean=similar if similar else None,
+    )
+    return None, error
+
+
 # Base annotations for read-only operations
 _BASE_ANNOTATIONS = {
     "readOnlyHint": True,
@@ -153,6 +189,11 @@ STATUS_ANNOTATIONS = ToolAnnotations(
 
 IMAGE_ANNOTATIONS = ToolAnnotations(
     title="Get reMarkable Page Image",
+    **_BASE_ANNOTATIONS,
+)
+
+PAGE_ANNOTATIONS = ToolAnnotations(
+    title="Get reMarkable Page Image with Metadata",
     **_BASE_ANNOTATIONS,
 )
 
@@ -335,46 +376,10 @@ async def remarkable_read(
         page_size = DEFAULT_PAGE_SIZE
 
         root = _get_root_path()
-        # Resolve user-provided path to actual device path
-        actual_document = _resolve_root_path(document) if document.startswith("/") else document
+        target_doc, doc_path = _resolve_document_target(document, collection, items_by_id, root)
+        if target_doc is None:
+            return doc_path
 
-        # Find the document by name or path (case-insensitive, not folders)
-        documents = [item for item in collection if not item.is_folder]
-        target_doc = None
-        document_lower = actual_document.lower().strip("/")
-
-        for doc in documents:
-            doc_path = get_item_path(doc, items_by_id)
-            # Filter by root path
-            if not _is_within_root(doc_path, root):
-                continue
-            # Match by name (case-insensitive)
-            if doc.VissibleName.lower() == document_lower:
-                target_doc = doc
-                break
-            # Also try matching by full path (case-insensitive)
-            if doc_path.lower().strip("/") == document_lower:
-                target_doc = doc
-                break
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
-
-        doc_path = get_item_path(target_doc, items_by_id)
         file_type = await run_blocking(get_file_type, client, target_doc)
 
         # Collect content based on content_type
@@ -1495,6 +1500,315 @@ async def remarkable_status() -> str:
         return make_response(result, hint)
 
 
+@mcp.tool(annotations=PAGE_ANNOTATIONS)
+async def remarkable_page(
+    document: str,
+    page: int = 1,
+    background: Optional[str] = None,
+    output_format: str = "png",
+    compatibility: bool = False,
+    include_ocr: bool = False,
+    render_merged: bool = False,
+    ctx: Optional[Context] = None,
+) -> Any:
+    """Return a page image together with pagination metadata.
+
+    This tool reuses the existing image rendering flow from remarkable_image,
+    while adding page-level metadata such as page, total_pages, modified, and
+    more. The image is returned in the same format as remarkable_image.
+    """
+    try:
+        # Resolve background color: use provided value or get from env/default
+        if background is None:
+            background = await run_blocking(get_background_color)
+
+        client = get_rmapi()
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+
+        root = _get_root_path()
+        target_doc, doc_path = _resolve_document_target(document, collection, items_by_id, root)
+        if target_doc is None:
+            return doc_path
+
+        raw_doc = await run_blocking(client.download, target_doc)
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(raw_doc)
+            tmp_path = Path(tmp.name)
+
+        try:
+            format_lower = output_format.lower()
+            if format_lower not in ("png", "svg"):
+                return make_error(
+                    error_type="invalid_format",
+                    message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
+                    suggestion="Use output_format='png' for raster or 'svg' for vectors.",
+                )
+
+            total_pages = await run_blocking(get_document_page_count, tmp_path)
+
+            if total_pages == 0:
+                return make_error(
+                    error_type="no_pages",
+                    message=f"Document '{target_doc.VissibleName}' has no renderable pages.",
+                    suggestion=(
+                        "This may be a PDF/EPUB without annotations. "
+                        "Use remarkable_read() to extract text content instead."
+                    ),
+                )
+
+            if page < 1 or page > total_pages:
+                return make_error(
+                    error_type="page_out_of_range",
+                    message=f"Page {page} does not exist. Document has {total_pages} page(s).",
+                    suggestion=f"Use page=1 to {total_pages} to view different pages.",
+                )
+
+            doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
+            uri_path = doc_path.lstrip("/")
+            merged_note = None
+            is_merged = False
+
+            if format_lower == "svg":
+                if render_merged:
+                    merged_note = (
+                        "render_merged is only supported with PNG format; "
+                        "returning annotation-only SVG."
+                    )
+
+                svg_content = await run_blocking(
+                    render_page_from_document_zip_svg,
+                    tmp_path,
+                    page,
+                    background_color=background,
+                )
+
+                if svg_content is None:
+                    return make_error(
+                        error_type="render_failed",
+                        message="Failed to render page to SVG.",
+                        suggestion=(
+                            "SVG output requires local stroke parsing, so the "
+                            "page may be empty or in a newer format. Try "
+                            "output_format='png', which falls back to the "
+                            "tablet's native PDF export in USB/SSH mode, or "
+                            "remarkable_read() to extract text instead."
+                        ),
+                    )
+
+                resource_uri = f"remarkablesvg:///{uri_path}.page-{page}.svg"
+                if compatibility:
+                    hint = (
+                        f"Page {page}/{total_pages} as SVG. "
+                        f"Use compatibility=False for embedded resource format."
+                    )
+                    if merged_note:
+                        hint = f"{merged_note} {hint}"
+                    response_data = {
+                        "document": target_doc.VissibleName,
+                        "path": _apply_root_filter(get_item_path(target_doc, items_by_id)),
+                        "svg": svg_content,
+                        "mime_type": "image/svg+xml",
+                        "page": page,
+                        "total_pages": total_pages,
+                        "modified": (
+                            target_doc.ModifiedClient
+                            if hasattr(target_doc, "ModifiedClient")
+                            else None
+                        ),
+                        "more": page < total_pages,
+                        "image": svg_content,
+                        "resource_uri": resource_uri,
+                        "merged": False,
+                    }
+                    return make_response(response_data, hint)
+
+                text_resource = TextResourceContents(
+                    uri=resource_uri,
+                    mimeType="image/svg+xml",
+                    text=svg_content,
+                )
+                embedded = EmbeddedResource(type="resource", resource=text_resource)
+                info_text = (
+                    f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as SVG. "
+                    f"Resource URI: {resource_uri}"
+                )
+                if merged_note:
+                    info_text = f"{merged_note}\n{info_text}"
+                info_text += (
+                    f"\nMetadata: page={page}, total_pages={total_pages}, "
+                    f"modified={target_doc.ModifiedClient if hasattr(target_doc, 'ModifiedClient') else None}, "
+                    f"more={page < total_pages}"
+                )
+                info = TextContent(type="text", text=info_text)
+                return [info, embedded]
+
+            if render_merged:
+                png_data, merged_note = await run_blocking(
+                    render_merged_page_from_document_zip,
+                    tmp_path,
+                    page,
+                    background_color=background,
+                )
+                is_merged = png_data is not None and merged_note is None
+            else:
+                png_data = await run_blocking(
+                    render_page_from_document_zip,
+                    tmp_path,
+                    page,
+                    background_color=background,
+                )
+
+            rendered_via_pdf = False
+            if png_data is None:
+                pdf_bytes = await run_blocking(download_raw_file, client, target_doc, "pdf")
+                if pdf_bytes:
+                    png_data = await run_blocking(render_tablet_pdf_page_to_png, pdf_bytes, page)
+                    rendered_via_pdf = png_data is not None
+
+            if png_data is None:
+                full = await run_blocking(
+                    render_page_full_page_from_document_zip,
+                    tmp_path,
+                    page,
+                    background_color=background,
+                )
+                if full is not None:
+                    png_data = full[0]
+
+            if png_data is None:
+                return make_error(
+                    error_type="render_failed",
+                    message="Failed to render page to image.",
+                    suggestion=(
+                        "The page may be empty, or local rendering dependencies "
+                        "(cairo/libcairo for cairosvg) may be missing. For PDF-backed "
+                        "documents the source PDF is used automatically as a fallback. "
+                        "You can also try remarkable_read() to extract text instead."
+                    ),
+                )
+
+            ocr_text = None
+            ocr_backend_used = None
+            if include_ocr:
+                if ctx and should_use_sampling_ocr(ctx):
+                    ocr_text = await ocr_via_sampling(ctx, png_data)
+                    if ocr_text:
+                        ocr_backend_used = "sampling"
+
+                if ocr_text is None:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as ocr_tmp:
+                        ocr_tmp.write(png_data)
+                        ocr_tmp_path = Path(ocr_tmp.name)
+                    try:
+                        backend = get_ocr_backend()
+                        if backend in ("sampling", "google") or (
+                            backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")
+                        ):
+                            ocr_text = await run_blocking(_ocr_png_google_vision, ocr_tmp_path)
+                            if ocr_text:
+                                ocr_backend_used = "google"
+                        if ocr_text is None:
+                            ocr_text = await run_blocking(_ocr_png_tesseract, ocr_tmp_path)
+                            if ocr_text:
+                                ocr_backend_used = "tesseract"
+                    finally:
+                        ocr_tmp_path.unlink(missing_ok=True)
+
+            uri_suffix = ".merged.png" if is_merged else ".png"
+            resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"
+            png_base64 = base64.b64encode(png_data).decode("utf-8")
+
+            ocr_info = {}
+            if include_ocr:
+                ocr_info["ocr_text"] = ocr_text
+                ocr_info["ocr_backend"] = ocr_backend_used
+                if ocr_text is None:
+                    ocr_info["ocr_message"] = "No text detected in image"
+
+            data_uri = f"data:image/png;base64,{png_base64}"
+            if compatibility:
+                hint = (
+                    f"Page {page}/{total_pages} as base64-encoded PNG. "
+                    f"Use 'data_uri' directly in HTML img src. "
+                    f"Use compatibility=False for embedded resource format."
+                )
+                if include_ocr and ocr_text:
+                    hint = f"Page {page}/{total_pages} with OCR text (backend: {ocr_backend_used})."
+                elif include_ocr:
+                    hint = f"Page {page}/{total_pages}. No text detected via OCR."
+                if merged_note:
+                    hint = f"{merged_note} {hint}"
+                elif is_merged:
+                    hint = f"Rendered with PDF + annotation compositing. {hint}"
+                if rendered_via_pdf:
+                    hint = (
+                        "Rendered via the tablet's native PDF export "
+                        "(local stroke render unavailable). " + hint
+                    )
+
+                response_data = {
+                    "document": target_doc.VissibleName,
+                    "path": _apply_root_filter(get_item_path(target_doc, items_by_id)),
+                    "data_uri": data_uri,
+                    "image_base64": png_base64,
+                    "image": data_uri,
+                    "mime_type": "image/png",
+                    "page": page,
+                    "total_pages": total_pages,
+                    "modified": (
+                        target_doc.ModifiedClient if hasattr(target_doc, "ModifiedClient") else None
+                    ),
+                    "more": page < total_pages,
+                    "resource_uri": resource_uri,
+                    "merged": is_merged,
+                    "render_source": "tablet_pdf" if rendered_via_pdf else "strokes",
+                    **ocr_info,
+                }
+                return make_response(response_data, hint)
+
+            blob_resource = BlobResourceContents(
+                uri=resource_uri,
+                mimeType="image/png",
+                blob=png_base64,
+            )
+            embedded = EmbeddedResource(type="resource", resource=blob_resource)
+
+            info_text = f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as PNG. "
+            info_text += f"Resource URI: {resource_uri}"
+            if is_merged:
+                info_text += "\nRendered with PDF + annotation compositing."
+            if rendered_via_pdf:
+                info_text += (
+                    "\nRendered via the tablet's native PDF export "
+                    "(local stroke render unavailable)."
+                )
+            if merged_note:
+                info_text += f"\nNote: {merged_note}"
+            if include_ocr and ocr_text:
+                info_text += f"\n\nOCR Text (via {ocr_backend_used}):\n{ocr_text}"
+            elif include_ocr:
+                info_text += "\n\nOCR: No text detected in image."
+            info_text += (
+                f"\nMetadata: page={page}, total_pages={total_pages}, "
+                f"modified={target_doc.ModifiedClient if hasattr(target_doc, 'ModifiedClient') else None}, "
+                f"more={page < total_pages}"
+            )
+
+            info = TextContent(type="text", text=info_text)
+            return [info, embedded]
+
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        return make_error(
+            error_type="image_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
 @mcp.tool(annotations=IMAGE_ANNOTATIONS)
 async def remarkable_image(
     document: str,
@@ -1505,7 +1819,7 @@ async def remarkable_image(
     include_ocr: bool = False,
     render_merged: bool = False,
     ctx: Optional[Context] = None,
-):
+) -> Any:
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
     <instructions>
@@ -1566,345 +1880,13 @@ async def remarkable_image(
     - remarkable_image("Annotated PDF", render_merged=True)  # PDF + annotations composited
     </examples>
     """
-    try:
-        # Resolve background color: use provided value or get from env/default
-        if background is None:
-            background = await run_blocking(get_background_color)
-
-        client = get_rmapi()
-        collection = await run_blocking(client.get_meta_items)
-        items_by_id = get_items_by_id(collection)
-
-        root = _get_root_path()
-        # Resolve user-provided path to actual device path
-        actual_document = _resolve_root_path(document) if document.startswith("/") else document
-
-        # Find the document by name or path (case-insensitive, not folders)
-        documents = [item for item in collection if not item.is_folder]
-        target_doc = None
-        document_lower = actual_document.lower().strip("/")
-
-        for doc in documents:
-            doc_path = get_item_path(doc, items_by_id)
-            # Filter by root path
-            if not _is_within_root(doc_path, root):
-                continue
-            # Match by name (case-insensitive)
-            if doc.VissibleName.lower() == document_lower:
-                target_doc = doc
-                break
-            # Also try matching by full path (case-insensitive)
-            if doc_path.lower().strip("/") == document_lower:
-                target_doc = doc
-                break
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
-
-        # Download the document
-        raw_doc = await run_blocking(client.download, target_doc)
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            tmp.write(raw_doc)
-            tmp_path = Path(tmp.name)
-
-        try:
-            # Validate format parameter
-            format_lower = output_format.lower()
-            if format_lower not in ("png", "svg"):
-                return make_error(
-                    error_type="invalid_format",
-                    message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
-                    suggestion="Use output_format='png' for raster or 'svg' for vectors.",
-                )
-
-            # Get total page count
-            total_pages = await run_blocking(get_document_page_count, tmp_path)
-
-            if total_pages == 0:
-                return make_error(
-                    error_type="no_pages",
-                    message=f"Document '{target_doc.VissibleName}' has no renderable pages.",
-                    suggestion=(
-                        "This may be a PDF/EPUB without annotations. "
-                        "Use remarkable_read() to extract text content instead."
-                    ),
-                )
-
-            if page < 1 or page > total_pages:
-                return make_error(
-                    error_type="page_out_of_range",
-                    message=f"Page {page} does not exist. Document has {total_pages} page(s).",
-                    suggestion=f"Use page=1 to {total_pages} to view different pages.",
-                )
-
-            # Build resource URI for this page
-            doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
-            uri_path = doc_path.lstrip("/")
-
-            # Render the page based on format
-            merged_note = None
-            is_merged = False
-
-            if format_lower == "svg":
-                if render_merged:
-                    merged_note = (
-                        "render_merged is only supported with PNG format; "
-                        "returning annotation-only SVG."
-                    )
-
-                svg_content = await run_blocking(
-                    render_page_from_document_zip_svg,
-                    tmp_path,
-                    page,
-                    background_color=background,
-                )
-
-                if svg_content is None:
-                    return make_error(
-                        error_type="render_failed",
-                        message="Failed to render page to SVG.",
-                        suggestion=(
-                            "SVG output requires local stroke parsing, so the "
-                            "page may be empty or in a newer format. Try "
-                            "output_format='png', which falls back to the "
-                            "tablet's native PDF export in USB/SSH mode, or "
-                            "remarkable_read() to extract text instead."
-                        ),
-                    )
-
-                resource_uri = f"remarkablesvg:///{uri_path}.page-{page}.svg"
-
-                if compatibility:
-                    # Return SVG content in JSON for clients without embedded resource support
-                    hint = (
-                        f"Page {page}/{total_pages} as SVG. "
-                        f"Use compatibility=False for embedded resource format."
-                    )
-                    if merged_note:
-                        hint = f"{merged_note} {hint}"
-                    response_data = {
-                        "svg": svg_content,
-                        "mime_type": "image/svg+xml",
-                        "page": page,
-                        "total_pages": total_pages,
-                        "resource_uri": resource_uri,
-                        "merged": False,
-                    }
-                    return make_response(response_data, hint)
-                else:
-                    # Return SVG as embedded TextResourceContents with info hint
-                    text_resource = TextResourceContents(
-                        uri=resource_uri,
-                        mimeType="image/svg+xml",
-                        text=svg_content,
-                    )
-                    embedded = EmbeddedResource(type="resource", resource=text_resource)
-                    info_text = (
-                        f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as SVG. "
-                        f"Resource URI: {resource_uri}"
-                    )
-                    if merged_note:
-                        info_text = f"{merged_note}\n{info_text}"
-                    info = TextContent(type="text", text=info_text)
-                    return [info, embedded]
-            else:
-                # PNG format
-                if render_merged:
-                    png_data, merged_note = await run_blocking(
-                        render_merged_page_from_document_zip,
-                        tmp_path,
-                        page,
-                        background_color=background,
-                    )
-                    is_merged = png_data is not None and merged_note is None
-                else:
-                    png_data = await run_blocking(
-                        render_page_from_document_zip,
-                        tmp_path,
-                        page,
-                        background_color=background,
-                    )
-
-                # Portable fallback: the local stroke renderer can fail to
-                # produce an image for empty pages, newer .rm block formats, or
-                # when the client machine lacks a working cairo/libcairo for
-                # cairosvg. In that case we rasterize the requested page from the
-                # document's source PDF with PyMuPDF (which needs no system
-                # cairo). USB/SSH expose the tablet's natively-rendered (merged)
-                # PDF; cloud exposes the original source PDF — either covers the
-                # failure cases above. Notebooks have no PDF, so download_raw_file
-                # returns None and this safely no-ops. Credit: ljdutel (#95).
-                rendered_via_pdf = False
-                if png_data is None:
-                    pdf_bytes = await run_blocking(download_raw_file, client, target_doc, "pdf")
-                    if pdf_bytes:
-                        png_data = await run_blocking(
-                            render_tablet_pdf_page_to_png, pdf_bytes, page
-                        )
-                        rendered_via_pdf = png_data is not None
-
-                # Blank-page fallback: the stroke renderer returns None for a
-                # notebook page with no drawable strokes (e.g. a freshly-created
-                # or blank page). The interactive canvas already renders such
-                # pages full-bleed at their own paper size; do the same here so a
-                # blank page yields a blank image instead of render_failed,
-                # keeping remarkable_image consistent with remarkable_canvas.
-                if png_data is None:
-                    full = await run_blocking(
-                        render_page_full_page_from_document_zip,
-                        tmp_path,
-                        page,
-                        background_color=background,
-                    )
-                    if full is not None:
-                        png_data = full[0]
-
-                if png_data is None:
-                    return make_error(
-                        error_type="render_failed",
-                        message="Failed to render page to image.",
-                        suggestion=(
-                            "The page may be empty, or local rendering "
-                            "dependencies (cairo/libcairo for cairosvg) may be "
-                            "missing. For PDF-backed documents the source PDF is "
-                            "used automatically as a fallback. You can also try "
-                            "remarkable_read() to extract text instead."
-                        ),
-                    )
-
-                # Handle OCR if requested - extract text from the image
-                ocr_text = None
-                ocr_backend_used = None
-                if include_ocr:
-                    # Try sampling-based OCR if configured and available
-                    # This sends the image to the client's LLM to extract text
-                    if ctx and should_use_sampling_ocr(ctx):
-                        ocr_text = await ocr_via_sampling(ctx, png_data)
-                        if ocr_text:
-                            ocr_backend_used = "sampling"
-
-                    # Fall back to traditional OCR if sampling failed or not available
-                    if ocr_text is None:
-                        # Need to temporarily save PNG to file for tesseract/google
-                        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as ocr_tmp:
-                            ocr_tmp.write(png_data)
-                            ocr_tmp_path = Path(ocr_tmp.name)
-                        try:
-                            backend = get_ocr_backend()
-                            # When backend is "sampling" but sampling failed, fall through to
-                            # Google (if API key available) or Tesseract as per documented behavior
-                            if backend in ("sampling", "google") or (
-                                backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")
-                            ):
-                                ocr_text = await run_blocking(_ocr_png_google_vision, ocr_tmp_path)
-                                if ocr_text:
-                                    ocr_backend_used = "google"
-                            # Fall through to Tesseract if Google not available or returned None
-                            if ocr_text is None:
-                                ocr_text = await run_blocking(_ocr_png_tesseract, ocr_tmp_path)
-                                if ocr_text:
-                                    ocr_backend_used = "tesseract"
-                        finally:
-                            ocr_tmp_path.unlink(missing_ok=True)
-
-                uri_suffix = ".merged.png" if is_merged else ".png"
-                resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"
-                png_base64 = base64.b64encode(png_data).decode("utf-8")
-
-                # Build OCR info for response if OCR was requested
-                ocr_info = {}
-                if include_ocr:
-                    ocr_info["ocr_text"] = ocr_text
-                    ocr_info["ocr_backend"] = ocr_backend_used
-                    if ocr_text is None:
-                        ocr_info["ocr_message"] = "No text detected in image"
-
-                if compatibility:
-                    # Return base64 PNG in JSON for clients without embedded resource support
-                    # Include data URI format for direct use in HTML <img> tags
-                    data_uri = f"data:image/png;base64,{png_base64}"
-                    hint = (
-                        f"Page {page}/{total_pages} as base64-encoded PNG. "
-                        f"Use 'data_uri' directly in HTML img src. "
-                        f"Use compatibility=False for embedded resource format."
-                    )
-                    if include_ocr and ocr_text:
-                        hint = (
-                            f"Page {page}/{total_pages} with OCR text "
-                            f"(backend: {ocr_backend_used})."
-                        )
-                    elif include_ocr:
-                        hint = f"Page {page}/{total_pages}. No text detected via OCR."
-                    if merged_note:
-                        hint = f"{merged_note} {hint}"
-                    elif is_merged:
-                        hint = f"Rendered with PDF + annotation compositing. {hint}"
-                    if rendered_via_pdf:
-                        hint = (
-                            "Rendered via the tablet's native PDF export "
-                            "(local stroke render unavailable). " + hint
-                        )
-
-                    response_data = {
-                        "data_uri": data_uri,
-                        "image_base64": png_base64,
-                        "mime_type": "image/png",
-                        "page": page,
-                        "total_pages": total_pages,
-                        "resource_uri": resource_uri,
-                        "merged": is_merged,
-                        "render_source": "tablet_pdf" if rendered_via_pdf else "strokes",
-                        **ocr_info,
-                    }
-                    return make_response(response_data, hint)
-                else:
-                    # Return PNG as embedded BlobResourceContents with info hint
-                    blob_resource = BlobResourceContents(
-                        uri=resource_uri,
-                        mimeType="image/png",
-                        blob=png_base64,
-                    )
-                    embedded = EmbeddedResource(type="resource", resource=blob_resource)
-
-                    info_text = f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as PNG. "
-                    info_text += f"Resource URI: {resource_uri}"
-                    if is_merged:
-                        info_text += "\nRendered with PDF + annotation compositing."
-                    if rendered_via_pdf:
-                        info_text += (
-                            "\nRendered via the tablet's native PDF export "
-                            "(local stroke render unavailable)."
-                        )
-                    if merged_note:
-                        info_text += f"\nNote: {merged_note}"
-                    if include_ocr and ocr_text:
-                        info_text += f"\n\nOCR Text (via {ocr_backend_used}):\n{ocr_text}"
-                    elif include_ocr:
-                        info_text += "\n\nOCR: No text detected in image."
-
-                    info = TextContent(type="text", text=info_text)
-                    return [info, embedded]
-
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-    except Exception as e:
-        return make_error(
-            error_type="image_failed",
-            message=str(e),
-            suggestion="Check remarkable_status() to verify your connection.",
-        )
+    return await remarkable_page(
+        document=document,
+        page=page,
+        background=background,
+        output_format=output_format,
+        compatibility=compatibility,
+        include_ocr=include_ocr,
+        render_merged=render_merged,
+        ctx=ctx,
+    )

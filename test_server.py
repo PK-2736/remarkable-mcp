@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import requests
+from mcp.types import BlobResourceContents
 
 from remarkable_mcp.api import (
     get_item_path,
@@ -781,6 +782,74 @@ class TestRemarkableImage:
         # Should get a not found error with suggestions
         assert "_error" in data
         assert data["_error"]["type"] == "document_not_found"
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_rmapi")
+    @patch("remarkable_mcp.tools.render_page_from_document_zip")
+    @patch("remarkable_mcp.tools.get_document_page_count")
+    async def test_page_tool_returns_metadata_and_image_for_compatibility_mode(
+        self,
+        mock_page_count,
+        mock_render_page,
+        mock_get_rmapi,
+        mock_document,
+    ):
+        """Test that remarkable_page returns metadata and image data in compatibility mode."""
+        mock_client = Mock()
+        mock_get_rmapi.return_value = mock_client
+        mock_document.is_folder = False
+        mock_document.ModifiedClient = "2025-11-28T10:30:00Z"
+        mock_document.VissibleName = "Test Doc"
+        mock_client.get_meta_items.return_value = [mock_document]
+        mock_client.download.return_value = b"fake zip"
+        mock_page_count.return_value = 3
+        fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        mock_render_page.return_value = fake_png
+
+        result = await mcp.call_tool(
+            "remarkable_page", {"document": "Test Doc", "page": 2, "compatibility": True}
+        )
+        assert len(result) == 1
+        assert hasattr(result[0], "text")
+        data = json.loads(result[0].text)
+
+        assert data["page"] == 2
+        assert data["total_pages"] == 3
+        assert data["more"] is True
+        assert data["modified"] == "2025-11-28T10:30:00Z"
+        assert data["document"] == "Test Doc"
+        assert data["path"] == "/Test Doc"
+        assert "image" in data
+        assert data["image"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_rmapi")
+    @patch("remarkable_mcp.tools.render_page_from_document_zip")
+    @patch("remarkable_mcp.tools.get_document_page_count")
+    async def test_page_tool_preserves_embedded_resource_shape_for_compatibility_false(
+        self,
+        mock_page_count,
+        mock_render_page,
+        mock_get_rmapi,
+        mock_document,
+    ):
+        """Test that compatibility=False preserves the legacy embedded-resource return shape."""
+        mock_client = Mock()
+        mock_get_rmapi.return_value = mock_client
+        mock_document.is_folder = False
+        mock_document.ModifiedClient = "2025-11-28T10:30:00Z"
+        mock_document.VissibleName = "Test Doc"
+        mock_client.get_meta_items.return_value = [mock_document]
+        mock_client.download.return_value = b"fake zip"
+        mock_page_count.return_value = 3
+        fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+        mock_render_page.return_value = fake_png
+
+        result = await mcp.call_tool("remarkable_page", {"document": "Test Doc", "page": 2})
+        assert len(result) == 2
+        assert hasattr(result[0], "text")
+        assert hasattr(result[1], "resource")
+        assert isinstance(result[1].resource, BlobResourceContents)
 
     @pytest.mark.asyncio
     async def test_image_compatibility_parameter_in_schema(self):
