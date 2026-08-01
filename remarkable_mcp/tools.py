@@ -138,7 +138,9 @@ def _resolve_document_target(document: str, collection, items_by_id: dict, root:
     if target_doc:
         return target_doc, get_item_path(target_doc, items_by_id)
 
-    filtered_docs = [doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)]
+    filtered_docs = [
+        doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
+    ]
     similar = find_similar_documents(document, filtered_docs)
     search_term = document.split()[0] if document else "notes"
     error = make_error(
@@ -203,11 +205,13 @@ DEFAULT_PAGE_SIZE = 8000
 
 def _is_cloud_archived(item) -> bool:
     """Check if an item is cloud-archived (not available on device)."""
-    # SSH mode: check is_cloud_archived property
-    if hasattr(item, "is_cloud_archived"):
-        return item.is_cloud_archived
-    # Cloud mode: check parent == "trash"
-    parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
+    value = getattr(item, "is_cloud_archived", None)
+    if isinstance(value, bool):
+        return value
+
+    parent = getattr(item, "Parent", None)
+    if parent is None:
+        parent = getattr(item, "parent", "")
     return parent == "trash"
 
 
@@ -231,6 +235,64 @@ def _modified_sort_key(item) -> float:
         except (OverflowError, OSError, ValueError):
             return 0.0
     return 0.0
+
+
+def _is_folder_item(item) -> bool:
+    """Return whether an item should be treated as a folder.
+
+    Some tests and transports expose items as generic mocks or objects without a
+    concrete ``is_folder`` flag. In those cases we treat them as documents.
+    """
+    value = getattr(item, "is_folder", False)
+    if isinstance(value, bool):
+        return value
+    return False
+
+
+def _get_item_tags(item) -> List[str]:
+    """Return normalized tags for an item or an empty list when unavailable."""
+    value = getattr(item, "tags", None)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(tag) for tag in value]
+    if isinstance(value, str):
+        return [value]
+    try:
+        return [str(tag) for tag in value]
+    except TypeError:
+        return []
+
+
+async def _get_document_total_pages(client, item) -> Optional[int]:
+    """Best-effort page count lookup for a document.
+
+    Downloads the document archive once and inspects its metadata-only
+    ``.content`` payload to determine the page count without generating images
+    or running OCR. Returns ``None`` if the archive cannot be downloaded or the
+    page count cannot be determined.
+    """
+    if _is_folder_item(item) or not hasattr(client, "download"):
+        return None
+
+    try:
+        archive_bytes = await run_blocking(client.download, item)
+    except Exception:
+        return None
+
+    if not isinstance(archive_bytes, (bytes, bytearray)) or not archive_bytes:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(archive_bytes)
+        tmp_path = Path(tmp.name)
+
+    try:
+        return await run_blocking(get_document_page_count, tmp_path)
+    except Exception:
+        return None
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _ocr_png_tesseract(png_path: Path) -> Optional[str]:
@@ -820,7 +882,8 @@ async def remarkable_browse(
        - Set tags=["tag1", "tag2"] to filter by tags
        - Works in both browse and search modes
 
-    Results include document names, types, modification dates, and tags.
+    Results include document names, types, modification dates, tags, and
+    total_pages where available.
 
     Note: If REMARKABLE_ROOT_PATH is configured, only documents within that
     folder are accessible. Paths are relative to the root path.
@@ -863,23 +926,24 @@ async def remarkable_browse(
                     continue
                 # Filter by tags if provided
                 if tags:
-                    item_tags_lower = [
-                        t.lower() for t in (item.tags if hasattr(item, "tags") else [])
-                    ]
+                    item_tags_lower = [tag.lower() for tag in _get_item_tags(item)]
                     if not any(tag.lower() in item_tags_lower for tag in tags):
                         continue
                 if query_lower in item.VissibleName.lower():
+                    is_folder = _is_folder_item(item)
                     match_info = {
                         "name": item.VissibleName,
                         "path": _apply_root_filter(item_path),
-                        "type": "folder" if item.is_folder else "document",
+                        "type": "folder" if is_folder else "document",
                         "modified": (
                             item.ModifiedClient if hasattr(item, "ModifiedClient") else None
                         ),
                     }
-                    # Add tags if present
-                    if hasattr(item, "tags") and item.tags:
-                        match_info["tags"] = item.tags
+                    if not is_folder:
+                        match_info["total_pages"] = await _get_document_total_pages(client, item)
+                    item_tags = _get_item_tags(item)
+                    if item_tags:
+                        match_info["tags"] = item_tags
                     matches.append(match_info)
 
             matches.sort(key=lambda x: x["name"])
@@ -925,7 +989,7 @@ async def remarkable_browse(
 
                 for item in items_by_parent.get(current_parent, []):
                     if item.VissibleName.lower() == part_lower:
-                        if item.is_folder:
+                        if _is_folder_item(item):
                             current_parent = item.ID
                             found = True
                             break
@@ -965,12 +1029,12 @@ async def remarkable_browse(
                     available_folders = [
                         item.VissibleName
                         for item in items_by_parent.get(current_parent, [])
-                        if item.is_folder
+                        if _is_folder_item(item)
                     ]
                     available_docs = [
                         item.VissibleName
                         for item in items_by_parent.get(current_parent, [])
-                        if not item.is_folder
+                        if not _is_folder_item(item)
                     ]
                     suggestion = "Use remarkable_browse('/') to see root folder contents."
                     if available_docs:
@@ -1001,11 +1065,12 @@ async def remarkable_browse(
             if _is_cloud_archived(item):
                 continue
             # Filter by tags if provided
-            if tags and not item.is_folder:
-                item_tags_lower = [t.lower() for t in (item.tags if hasattr(item, "tags") else [])]
+            if tags and not _is_folder_item(item):
+                item_tags_lower = [tag.lower() for tag in _get_item_tags(item)]
                 if not any(tag.lower() in item_tags_lower for tag in tags):
                     continue
-            if item.is_folder:
+            is_folder = _is_folder_item(item)
+            if is_folder:
                 folders.append({"name": item.VissibleName, "id": item.ID})
             else:
                 doc_info = {
@@ -1013,9 +1078,10 @@ async def remarkable_browse(
                     "id": item.ID,
                     "modified": (item.ModifiedClient if hasattr(item, "ModifiedClient") else None),
                 }
-                # Add tags if present
-                if hasattr(item, "tags") and item.tags:
-                    doc_info["tags"] = item.tags
+                doc_info["total_pages"] = await _get_document_total_pages(client, item)
+                item_tags = _get_item_tags(item)
+                if item_tags:
+                    doc_info["tags"] = item_tags
                 documents.append(doc_info)
 
         result = {"mode": "browse", "path": path, "folders": folders, "documents": documents}
@@ -1635,9 +1701,14 @@ async def remarkable_page(
                 )
                 if merged_note:
                     info_text = f"{merged_note}\n{info_text}"
+                modified_value = (
+                    target_doc.ModifiedClient
+                    if hasattr(target_doc, "ModifiedClient")
+                    else None
+                )
                 info_text += (
                     f"\nMetadata: page={page}, total_pages={total_pages}, "
-                    f"modified={target_doc.ModifiedClient if hasattr(target_doc, 'ModifiedClient') else None}, "
+                    f"modified={modified_value}, "
                     f"more={page < total_pages}"
                 )
                 info = TextContent(type="text", text=info_text)
@@ -1789,9 +1860,14 @@ async def remarkable_page(
                 info_text += f"\n\nOCR Text (via {ocr_backend_used}):\n{ocr_text}"
             elif include_ocr:
                 info_text += "\n\nOCR: No text detected in image."
+            modified_value = (
+                target_doc.ModifiedClient
+                if hasattr(target_doc, "ModifiedClient")
+                else None
+            )
             info_text += (
                 f"\nMetadata: page={page}, total_pages={total_pages}, "
-                f"modified={target_doc.ModifiedClient if hasattr(target_doc, 'ModifiedClient') else None}, "
+                f"modified={modified_value}, "
                 f"more={page < total_pages}"
             )
 

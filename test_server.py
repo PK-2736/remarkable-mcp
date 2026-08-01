@@ -418,6 +418,55 @@ class TestRemarkableBrowse:
         assert "_error" in data
         assert data["_error"]["type"] == "browse_failed"
 
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_document_page_count", return_value=7)
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_browse_includes_total_pages(self, mock_get_rmapi, _mock_page_count):
+        """Browse documents should include total_pages when available."""
+        mock_client = Mock()
+        mock_client.download.return_value = b"zip-bytes"
+        mock_get_rmapi.return_value = mock_client
+
+        mock_doc = Mock()
+        mock_doc.VissibleName = "Study Notes"
+        mock_doc.ID = "doc-123"
+        mock_doc.Parent = ""
+        mock_doc.is_folder = False
+        mock_doc.ModifiedClient = "2024-01-15"
+        mock_doc.tags = []
+
+        mock_client.get_meta_items.return_value = [mock_doc]
+
+        result = await mcp.call_tool("remarkable_browse", {"path": "/"})
+        data = json.loads(result[0][0].text)
+
+        assert data["mode"] == "browse"
+        assert data["documents"][0]["total_pages"] == 7
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_document_page_count", side_effect=RuntimeError("boom"))
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_browse_total_pages_falls_back_to_null(self, mock_get_rmapi, _mock_page_count):
+        """Browse documents should return null total_pages when metadata cannot be read."""
+        mock_client = Mock()
+        mock_client.download.return_value = b"zip-bytes"
+        mock_get_rmapi.return_value = mock_client
+
+        mock_doc = Mock()
+        mock_doc.VissibleName = "Study Notes"
+        mock_doc.ID = "doc-123"
+        mock_doc.Parent = ""
+        mock_doc.is_folder = False
+        mock_doc.ModifiedClient = "2024-01-15"
+        mock_doc.tags = []
+
+        mock_client.get_meta_items.return_value = [mock_doc]
+
+        result = await mcp.call_tool("remarkable_browse", {"path": "/"})
+        data = json.loads(result[0][0].text)
+
+        assert data["documents"][0]["total_pages"] is None
+
 
 # =============================================================================
 # Test remarkable_recent Tool
