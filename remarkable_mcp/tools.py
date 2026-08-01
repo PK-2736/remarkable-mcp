@@ -7,6 +7,7 @@ USB web) and do not modify any documents.
 """
 
 import base64
+import logging
 import os
 import re
 import tempfile
@@ -56,6 +57,26 @@ from remarkable_mcp.sampling import (
     should_use_sampling_ocr,
 )
 from remarkable_mcp.server import mcp
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_debug_filename(value: str) -> str:
+    """Return a filesystem-safe name for debug image dumps."""
+    safe_value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    return safe_value or "document"
+
+
+def _maybe_dump_rendered_png(png_data: bytes, document_name: str, page: int) -> Optional[Path]:
+    """Persist a rendered page PNG to /tmp/remarkable-debug for debugging."""
+    debug_dir = Path("/tmp/remarkable-debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_document = _sanitize_debug_filename(document_name)
+    dump_path = debug_dir / f"{safe_document}_page-{page}.png"
+    dump_path.write_bytes(png_data)
+    logger.info("Dumped rendered PNG for page %s to %s", page, dump_path)
+    return dump_path
 
 
 def _get_root_path() -> str:
@@ -1788,6 +1809,7 @@ async def remarkable_page(
 
             uri_suffix = ".merged.png" if is_merged else ".png"
             resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"
+            _maybe_dump_rendered_png(png_data, target_doc.VissibleName, page)
             png_base64 = base64.b64encode(png_data).decode("utf-8")
 
             ocr_info = {}

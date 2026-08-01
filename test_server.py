@@ -5,6 +5,7 @@ Tests for reMarkable MCP Server
 Tests the 4 intent-based tools using FastMCP's testing capabilities.
 """
 
+import base64
 import json
 import os
 import sys
@@ -471,6 +472,70 @@ class TestRemarkableBrowse:
 # =============================================================================
 # Test remarkable_recent Tool
 # =============================================================================
+
+
+class TestRemarkablePage:
+    """Test remarkable_page image resource behavior."""
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_background_color", return_value="#FFFFFF")
+    @patch("remarkable_mcp.tools.render_page_from_document_zip", return_value=b"fake-png-bytes")
+    @patch("remarkable_mcp.tools.get_document_page_count", return_value=1)
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_page_blob_contains_rendered_png_bytes(
+        self, mock_get_rmapi, _mock_page_count, _mock_render, _mock_background
+    ):
+        """remarkable_page should embed the rendered page PNG as base64 in the resource blob."""
+        mock_client = Mock()
+        mock_client.download.return_value = b"zip-bytes"
+        mock_get_rmapi.return_value = mock_client
+
+        mock_doc = Mock()
+        mock_doc.VissibleName = "Handwritten Notes"
+        mock_doc.ID = "doc-1"
+        mock_doc.Parent = ""
+        mock_doc.is_folder = False
+        mock_doc.ModifiedClient = "2024-01-15"
+
+        mock_client.get_meta_items.return_value = [mock_doc]
+
+        result = await mcp.call_tool("remarkable_page", {"document": "Handwritten Notes"})
+        embedded = result[1]
+
+        assert embedded.resource.mimeType == "image/png"
+        assert embedded.resource.blob == base64.b64encode(b"fake-png-bytes").decode("utf-8")
+
+    @pytest.mark.asyncio
+    @patch("remarkable_mcp.tools.get_background_color", return_value="#FFFFFF")
+    @patch("remarkable_mcp.tools.render_page_from_document_zip", return_value=b"fake-png-bytes")
+    @patch("remarkable_mcp.tools.get_document_page_count", return_value=1)
+    @patch("remarkable_mcp.tools.get_rmapi")
+    async def test_page_dump_debug_png_file(
+        self, mock_get_rmapi, _mock_page_count, _mock_render, _mock_background
+    ):
+        """remarkable_page should dump the rendered PNG bytes when debug mode is enabled."""
+        mock_client = Mock()
+        mock_client.download.return_value = b"zip-bytes"
+        mock_get_rmapi.return_value = mock_client
+
+        mock_doc = Mock()
+        mock_doc.VissibleName = "Handwritten Notes"
+        mock_doc.ID = "doc-1"
+        mock_doc.Parent = ""
+        mock_doc.is_folder = False
+        mock_doc.ModifiedClient = "2024-01-15"
+
+        mock_client.get_meta_items.return_value = [mock_doc]
+
+        dump_path = Path("/tmp/remarkable-debug/Handwritten_Notes_page-1.png")
+        if dump_path.exists():
+            dump_path.unlink()
+
+        await mcp.call_tool("remarkable_page", {"document": "Handwritten Notes"})
+
+        assert dump_path.exists()
+        assert dump_path.read_bytes() == b"fake-png-bytes"
+        dump_path.unlink(missing_ok=True)
 
 
 class TestRemarkableRecent:
